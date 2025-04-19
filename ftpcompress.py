@@ -16,7 +16,7 @@ class FtpVideoCompressor:
     def __init__(self, ftp_host, ftp_user, ftp_password, ftp_directory, output_dir, 
                  target_vmaf_diff=8, max_concurrent=2, audio_track=0, include_subtitles=False, 
                  subtitle_track=None, skip_existing=True, replace_originals=True, storage_zone=None,
-                 scan_all=False):
+                 scan_all=False, start_folder=None, progress_file=None):
         self.ftp_host = ftp_host
         self.ftp_user = ftp_user
         self.ftp_password = ftp_password
@@ -35,6 +35,11 @@ class FtpVideoCompressor:
         self.temp_dir = os.path.join(output_dir, "temp_analysis")
         self.folder_settings_cache = {}  # Cache for folder-specific encoding settings
         
+        # New parameters for restart functionality
+        self.start_folder = start_folder
+        self.progress_file = progress_file or os.path.join(output_dir, "progress.txt")
+        self.processed_folders = self.load_processed_folders()
+        
         # Statistics tracking
         self.original_size_total = 0  # Total size of original files in bytes
         self.encoded_size_total = 0   # Total size of encoded files in bytes
@@ -44,16 +49,40 @@ class FtpVideoCompressor:
         for directory in [self.output_dir, self.download_dir, self.temp_dir]:
             os.makedirs(directory, exist_ok=True)
 
-    def scan_storage(self):
-        """Special handling for scanning storage with proper path handling"""
-        print("Using improvedstorage scanning mode...")
+    def load_processed_folders(self):
+        """Load the list of already processed folders"""
+        processed_folders = set()
+        if os.path.exists(self.progress_file):
+            try:
+                with open(self.progress_file, 'r') as f:
+                    for line in f:
+                        folder = line.strip()
+                        if folder:
+                            processed_folders.add(folder)
+                print(f"Loaded {len(processed_folders)} previously processed folders")
+            except Exception as e:
+                print(f"Error loading progress file: {e}")
+        return processed_folders
+
+    def save_folder_progress(self, folder):
+        """Save a folder to the progress file after it's processed"""
+        try:
+            with open(self.progress_file, 'a') as f:
+                f.write(f"{folder}\n")
+            self.processed_folders.add(folder)
+        except Exception as e:
+            print(f"Error saving progress: {e}")
+
+    def scan_bunnycdn_storage(self):
+        """Special handling for scanning BunnyCDN storage with proper path handling"""
+        print("Using improved BunnyCDN storage scanning mode...")
 
         files = []
 
         try:
             with ftplib.FTP(self.ftp_host) as ftp:
                 ftp.login(self.ftp_user, self.ftp_password)
-                print("Successfully connected to storage")
+                print("Successfully connected to BunnyCDN storage")
 
                 # Get the current working directory - important for relative path operations
                 current_root = ftp.pwd()
@@ -192,7 +221,7 @@ class FtpVideoCompressor:
                 print(f"Total video files found: {len(files)}")
 
         except Exception as e:
-            print(f"Error scanning storage: {e}")
+            print(f"Error scanning BunnyCDN storage: {e}")
             import traceback
             traceback.print_exc()
 
@@ -859,121 +888,174 @@ class FtpVideoCompressor:
             return False
             
     def process_batch(self):
-        """Main method to process all videos from the FTP server"""
-        try:
-            print(f"Starting FTP Video Compressor with VMAF diff target: {self.target_vmaf_diff}")
-            print(f"Using parallel processing with {self.max_concurrent} concurrent jobs")
-            
-            is_bunnycdn = "bunnycdn" in self.ftp_host.lower()
-            if is_bunnycdn:
-                print("Detected BunnyCDN storage service")
-                remote_files = self.scan_storage()
-            else:
-                # Use standard FTP scanning
-                remote_files = self.list_ftp_files()
-                
-            total_files = len(remote_files)
-            
-            if total_files == 0:
-                print("No video files found on the FTP server.")
-                return
-                
-            print(f"Found {total_files} video files to process.")
-            
-            # Process files with parallel execution
-            processed_count = 0
-            failed_count = 0
-            
-            # Group files by folder for efficient processing
-            files_by_folder = {}
-            for file in remote_files:
-                folder = self.get_folder_from_path(file)
-                if folder not in files_by_folder:
-                    files_by_folder[folder] = []
-                files_by_folder[folder].append(file)
-            
-            print(f"Files grouped into {len(files_by_folder)} folders")
-            
-            # Initialize stats tracking
-            start_time = time.time()
-            
-            # Process each folder's files
-            for folder, folder_files in files_by_folder.items():
-                print(f"\nProcessing folder: {folder} ({len(folder_files)} files)")
-                
-                # Process files in parallel using ThreadPoolExecutor
-                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
-                    futures = {executor.submit(self.process_video, file): file for file in folder_files}
-                    
-                    for future in concurrent.futures.as_completed(futures):
-                        file = futures[future]
-                        try:
-                            success = future.result()
-                            if success:
-                                processed_count += 1
-                                print(f"Progress: {processed_count}/{total_files} files processed")
-                            else:
-                                failed_count += 1
-                                print(f"Failed to process: {file}")
-                        except Exception as e:
-                            failed_count += 1
-                            print(f"Error processing {file}: {e}")
-                
-                # Display storage savings after each folder
-                if self.processed_files_count > 0:
-                    total_saved = self.original_size_total - self.encoded_size_total
-                    total_saved_gb = total_saved / (1024 ** 3)
-                    reduction_percent = (total_saved / self.original_size_total) * 100 if self.original_size_total > 0 else 0
-                    print(f"\n--- Storage savings after folder '{folder}' ---")
-                    print(f"Original size: {self.format_size(self.original_size_total)}")
-                    print(f"Encoded size:  {self.format_size(self.encoded_size_total)}")
-                    print(f"Space saved:   {self.format_size(total_saved)} ({reduction_percent:.1f}%)")
-                    print(f"               {total_saved_gb:.2f} GB")
-            
-            # Calculate execution time
-            total_time = time.time() - start_time
-            hours, remainder = divmod(total_time, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            
-            # Final summary
-            print("\n" + "="*60)
-            print(f"Processing complete!")
-            print(f"Total execution time: {int(hours)}h {int(minutes)}m {int(seconds)}s")
-            print(f"Total files: {total_files}")
-            print(f"Successfully processed: {processed_count}")
-            print(f"Failed: {failed_count}")
-            
-            # Display final storage statistics
-            if self.processed_files_count > 0:
-                total_saved = self.original_size_total - self.encoded_size_total
-                total_saved_gb = total_saved / (1024 ** 3)
-                reduction_percent = (total_saved / self.original_size_total) * 100 if self.original_size_total > 0 else 0
-                
-                print("\n--- FINAL STORAGE SAVINGS ---")
-                print(f"Original total size: {self.format_size(self.original_size_total)}")
-                print(f"Encoded total size:  {self.format_size(self.encoded_size_total)}")
-                print(f"Total space saved:   {self.format_size(total_saved)} ({reduction_percent:.1f}%)")
-                print(f"                     {total_saved_gb:.2f} GB")
-                
-                # Calculate average file size reduction
-                if processed_count > 0:
-                    avg_original = self.original_size_total / processed_count
-                    avg_encoded = self.encoded_size_total / processed_count
-                    avg_savings = (avg_original - avg_encoded) / avg_original * 100 if avg_original > 0 else 0
-                    print(f"\nAverage file size reduction: {avg_savings:.1f}%")
-                    print(f"Average original size: {self.format_size(avg_original)}")
-                    print(f"Average encoded size:  {self.format_size(avg_encoded)}")
-            
-            print("="*60)
-            
-            # Clean up temporary directory
-            if os.path.exists(self.temp_dir):
-                import shutil
-                shutil.rmtree(self.temp_dir)
-                
-        except Exception as e:
-            print(f"Error in batch processing: {e}")
-            raise
+       """Main method to process all videos from the FTP server with restart capability"""
+       try:
+           print(f"Starting FTP Video Compressor with VMAF diff target: {self.target_vmaf_diff}")
+           print(f"Using parallel processing with {self.max_concurrent} concurrent jobs")
+           
+           # Determine if we need to use BunnyCDN-specific scanning
+           is_bunnycdn = "bunnycdn" in self.ftp_host.lower()
+           if is_bunnycdn:
+               print("Detected BunnyCDN storage service")
+               remote_files = self.scan_bunnycdn_storage()
+           else:
+               # Use standard FTP scanning
+               remote_files = self.list_ftp_files()
+               
+           total_files = len(remote_files)
+           
+           if total_files == 0:
+               print("No video files found on the FTP server.")
+               return
+               
+           print(f"Found {total_files} video files to process.")
+           
+           # Process files with parallel execution
+           processed_count = 0
+           failed_count = 0
+           
+           # Group files by folder for efficient processing
+           files_by_folder = {}
+           for file in remote_files:
+               folder = self.get_folder_from_path(file)
+               if folder not in files_by_folder:
+                   files_by_folder[folder] = []
+               files_by_folder[folder].append(file)
+           
+           print(f"Files grouped into {len(files_by_folder)} folders")
+           
+           # Initialize stats tracking
+           start_time = time.time()
+           
+           # Get sorted list of folders to enable resuming from a specific folder
+           sorted_folders = sorted(files_by_folder.keys())
+           
+           # Track if we've found our starting folder
+           found_start_folder = self.start_folder is None
+           skipped_folders_count = 0
+           
+           # Print available folders to help users find the correct name
+           print("\nAvailable folders:")
+           for i, folder in enumerate(sorted_folders):
+               # Print only the first 20 folders, then every 10th folder to avoid flooding the console
+               if i < 20 or i % 10 == 0:
+                   print(f"  {i+1}. {folder}")
+           
+           # If a specific starting folder was requested but not found, print complete list for debugging
+           if self.start_folder and not any(self.start_folder.lower() in f.lower() for f in sorted_folders):
+               print("\nWARNING: Requested start folder might not exist. Here's the complete folder list:")
+               for i, folder in enumerate(sorted_folders):
+                   print(f"  {i+1}. {folder}")
+           
+           # Process each folder's files
+           for folder in sorted_folders:
+               folder_files = files_by_folder[folder]
+               
+               # Skip folders until we reach the starting folder
+               if not found_start_folder and self.start_folder:
+                   # More flexible matching - case insensitive and partial path matching
+                   start_folder_lower = self.start_folder.lower()
+                   folder_lower = folder.lower()
+                   
+                   # Different matching strategies:
+                   # 1. Exact match (case-insensitive)
+                   # 2. Path ending with the folder name
+                   # 3. Contains the folder name
+                   if (folder_lower == start_folder_lower or 
+                       folder_lower.endswith("/" + start_folder_lower) or
+                       start_folder_lower in folder_lower):
+                       found_start_folder = True
+                       print(f"\nResuming from folder: {folder}")
+                   else:
+                       skipped_folders_count += 1
+                       # Print progress every 10 folders
+                       if skipped_folders_count % 10 == 0:
+                           print(f"Skipped {skipped_folders_count} folders, still looking for {self.start_folder}...")
+                       continue
+               
+               # Skip already processed folders
+               if folder in self.processed_folders:
+                   print(f"\nSkipping already processed folder: {folder}")
+                   continue
+                   
+               print(f"\nProcessing folder: {folder} ({len(folder_files)} files)")
+               
+               # Process files in parallel using ThreadPoolExecutor
+               with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+                   futures = {executor.submit(self.process_video, file): file for file in folder_files}
+                   
+                   for future in concurrent.futures.as_completed(futures):
+                       file = futures[future]
+                       try:
+                           success = future.result()
+                           if success:
+                               processed_count += 1
+                               print(f"Progress: {processed_count}/{total_files} files processed")
+                           else:
+                               failed_count += 1
+                               print(f"Failed to process: {file}")
+                       except Exception as e:
+                           failed_count += 1
+                           print(f"Error processing {file}: {e}")
+               
+               # Mark folder as processed and save progress
+               self.save_folder_progress(folder)
+               
+               # Display storage savings after each folder
+               if self.processed_files_count > 0:
+                   total_saved = self.original_size_total - self.encoded_size_total
+                   total_saved_gb = total_saved / (1024 ** 3)
+                   reduction_percent = (total_saved / self.original_size_total) * 100 if self.original_size_total > 0 else 0
+                   print(f"\n--- Storage savings after folder '{folder}' ---")
+                   print(f"Original size: {self.format_size(self.original_size_total)}")
+                   print(f"Encoded size:  {self.format_size(self.encoded_size_total)}")
+                   print(f"Space saved:   {self.format_size(total_saved)} ({reduction_percent:.1f}%)")
+                   print(f"               {total_saved_gb:.2f} GB")
+           
+           # Calculate execution time
+           total_time = time.time() - start_time
+           hours, remainder = divmod(total_time, 3600)
+           minutes, seconds = divmod(remainder, 60)
+           
+           # Final summary
+           print("\n" + "="*60)
+           print(f"Processing complete!")
+           print(f"Total execution time: {int(hours)}h {int(minutes)}m {int(seconds)}s")
+           print(f"Total files: {total_files}")
+           print(f"Successfully processed: {processed_count}")
+           print(f"Failed: {failed_count}")
+           
+           # Display final storage statistics
+           if self.processed_files_count > 0:
+               total_saved = self.original_size_total - self.encoded_size_total
+               total_saved_gb = total_saved / (1024 ** 3)
+               reduction_percent = (total_saved / self.original_size_total) * 100 if self.original_size_total > 0 else 0
+               
+               print("\n--- FINAL STORAGE SAVINGS ---")
+               print(f"Original total size: {self.format_size(self.original_size_total)}")
+               print(f"Encoded total size:  {self.format_size(self.encoded_size_total)}")
+               print(f"Total space saved:   {self.format_size(total_saved)} ({reduction_percent:.1f}%)")
+               print(f"                     {total_saved_gb:.2f} GB")
+               
+               # Calculate average file size reduction
+               if processed_count > 0:
+                   avg_original = self.original_size_total / processed_count
+                   avg_encoded = self.encoded_size_total / processed_count
+                   avg_savings = (avg_original - avg_encoded) / avg_original * 100 if avg_original > 0 else 0
+                   print(f"\nAverage file size reduction: {avg_savings:.1f}%")
+                   print(f"Average original size: {self.format_size(avg_original)}")
+                   print(f"Average encoded size:  {self.format_size(avg_encoded)}")
+           
+           print("="*60)
+           
+           # Clean up temporary directory
+           if os.path.exists(self.temp_dir):
+               import shutil
+               shutil.rmtree(self.temp_dir)
+               
+       except Exception as e:
+           print(f"Error in batch processing: {e}")
+           raise
 
     def extract_video_sample(self, input_file, output_file, start_time, duration):
         """Extract a short sample from a video file for analysis"""
@@ -1159,6 +1241,12 @@ def parse_arguments():
     parser.add_argument('--subtitle-track', type=int, default=0, help='Subtitle track to include (default: 0)')
     parser.add_argument('--scan-all', action='store_true', help='Scan all directories including those that fail initially (for BunnyCDN)')
     
+    # New restart-related arguments
+    parser.add_argument('--start-folder', help='Start processing from this specific folder')
+    parser.add_argument('--progress-file', help='File to track processed folders for resuming')
+    parser.add_argument('--list-folders', action='store_true', help='Just list all available folders and exit')
+    parser.add_argument('--start-index', type=int, help='Start processing from the folder at this index (1-based)')
+    
     return parser.parse_args()
 
 def main():
@@ -1172,6 +1260,9 @@ def main():
         print(f"Concurrent processing: {args.concurrent}")
         print(f"Output directory: {args.output}")
         print(f"Replace originals: {args.replace_originals}")
+        
+        if args.start_folder:
+            print(f"Will start processing from folder: {args.start_folder}")
         
         # Detect if we're using BunnyCDN
         is_bunnycdn = "bunnycdn" in args.host.lower()
@@ -1244,8 +1335,56 @@ def main():
             skip_existing=args.skip_existing,
             replace_originals=args.replace_originals,
             storage_zone=args.storage_zone,
-            scan_all=args.scan_all if hasattr(args, 'scan_all') else False
+            scan_all=args.scan_all if hasattr(args, 'scan_all') else False,
+            start_folder=args.start_folder,
+            progress_file=args.progress_file
         )
+        
+        # If we just want to list folders, do that and exit
+        if args.list_folders:
+            # This will just scan and list folders without processing
+            files = compressor.scan_bunnycdn_storage() if "bunnycdn" in args.host.lower() else compressor.list_ftp_files()
+            
+            # Group files by folder
+            folders = set()
+            for file in files:
+                folder = compressor.get_folder_from_path(file)
+                folders.add(folder)
+            
+            # Sort and print all folders
+            sorted_folders = sorted(folders)
+            print("\nAll available folders:")
+            for i, folder in enumerate(sorted_folders):
+                print(f"  {i+1}. {folder}")
+            
+            print(f"\nTotal folders: {len(sorted_folders)}")
+            print("Use --start-folder 'foldername' or --start-index N to begin processing from a specific folder")
+            return 0
+            
+        # Handle starting from a specific index if requested
+        if args.start_index is not None and args.start_index > 0:
+            # We'll need to modify the compressor to use this index
+            # First, scan to get all folders
+            files = compressor.scan_bunnycdn_storage() if "bunnycdn" in args.host.lower() else compressor.list_ftp_files()
+            
+            # Group and sort folders
+            folders = set()
+            for file in files:
+                folder = compressor.get_folder_from_path(file)
+                folders.add(folder)
+            
+            sorted_folders = sorted(folders)
+            
+            # Check if the index is valid
+            if args.start_index <= len(sorted_folders):
+                # Convert 1-based index to 0-based
+                folder_index = args.start_index - 1
+                target_folder = sorted_folders[folder_index]
+                print(f"Starting from folder at index {args.start_index}: {target_folder}")
+                compressor.start_folder = target_folder
+            else:
+                print(f"ERROR: Start index {args.start_index} is out of range. Max index is {len(sorted_folders)}")
+                return 1
         
         # Process all videos
         compressor.process_batch()
